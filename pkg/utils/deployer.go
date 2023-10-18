@@ -418,7 +418,7 @@ func ApplyDescription(ctx context.Context, clusternetClient *clusternetclientset
 
 			// dryApply means do not apply resources, just add sub resource watcher.
 			if !dryApply {
-				retryErr := ApplyResourceWithRetry(ctx, dynamicClient, discoveryRESTMapper, resource, ignoreAdd)
+				retryErr := ApplyResource(ctx, dynamicClient, discoveryRESTMapper, resource, ignoreAdd)
 				if retryErr != nil {
 					errCh <- retryErr
 					return
@@ -603,6 +603,51 @@ func ApplyResourceWithRetry(ctx context.Context, dynamicClient dynamic.Interface
 		return nil
 	}
 	return lastError
+}
+
+func ApplyResource(ctx context.Context, dynamicClient dynamic.Interface, restMapper meta.RESTMapper,
+	resource *unstructured.Unstructured, ignoreAdd bool) error {
+	restMapping, err := restMapper.RESTMapping(resource.GroupVersionKind().GroupKind(), resource.GroupVersionKind().Version)
+	if err != nil {
+		return err
+	}
+
+	curObj, err := dynamicClient.Resource(restMapping.Resource).Namespace(resource.GetNamespace()).
+		Get(context.TODO(), resource.GetName(), metav1.GetOptions{})
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+
+		_, err = dynamicClient.Resource(restMapping.Resource).Namespace(resource.GetNamespace()).
+			Create(context.TODO(), resource, metav1.CreateOptions{})
+		return err
+	}
+
+	if ResourceNeedResync(resource, curObj, ignoreAdd) {
+		// try to update resource
+		if err = doApplyPatch(ctx, dynamicClient, restMapper, resource, curObj); err == nil {
+			return nil
+		}
+		statusCauses, ok := getStatusCause(err)
+		if !ok {
+			return err
+		}
+		resourceCopy := resource.DeepCopy()
+		for _, cause := range statusCauses {
+			if cause.Type != metav1.CauseTypeFieldValueInvalid {
+				continue
+			}
+			// apply immutable value
+			fields := strings.Split(cause.Field, ".")
+			setNestedField(resourceCopy, getNestedString(curObj.Object, fields...), fields...)
+		}
+		// update with immutable values applied
+		// try to update resource
+		return doApplyPatch(ctx, dynamicClient, restMapper, resourceCopy, curObj)
+	}
+
+	return nil
 }
 
 func getOriginalConfiguration(current *unstructured.Unstructured) []byte {
