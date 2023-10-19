@@ -612,42 +612,50 @@ func ApplyResource(ctx context.Context, dynamicClient dynamic.Interface, restMap
 		return err
 	}
 
-	curObj, err := dynamicClient.Resource(restMapping.Resource).Namespace(resource.GetNamespace()).
-		Get(context.TODO(), resource.GetName(), metav1.GetOptions{})
+	curObj, err := dynamicClient.Resource(restMapping.Resource).Namespace(resource.GetNamespace()).Get(context.TODO(), resource.GetName(), metav1.GetOptions{})
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
 			return err
 		}
 
-		_, err = dynamicClient.Resource(restMapping.Resource).Namespace(resource.GetNamespace()).
-			Create(context.TODO(), resource, metav1.CreateOptions{})
+		_, err = dynamicClient.Resource(restMapping.Resource).Namespace(resource.GetNamespace()).Create(context.TODO(), resource, metav1.CreateOptions{})
 		return err
 	}
 
 	if ResourceNeedResync(resource, curObj, ignoreAdd) {
-		// try to update resource
-		if err = doApplyPatch(ctx, dynamicClient, restMapper, resource, curObj); err == nil {
-			return nil
-		}
-		statusCauses, ok := getStatusCause(err)
-		if !ok {
-			return err
-		}
-		resourceCopy := resource.DeepCopy()
-		for _, cause := range statusCauses {
-			if cause.Type != metav1.CauseTypeFieldValueInvalid {
-				continue
+		var patchError error
+		err = wait.ExponentialBackoffWithContext(ctx, retry.DefaultBackoff, func(ctx context.Context) (bool, error) {
+			// try to update resource
+			if patchError == nil {
+				if patchError = doApplyPatch(ctx, dynamicClient, restMapper, resource, curObj); patchError == nil {
+					return true, nil
+				}
 			}
-			// apply immutable value
-			fields := strings.Split(cause.Field, ".")
-			setNestedField(resourceCopy, getNestedString(curObj.Object, fields...), fields...)
-		}
-		// update with immutable values applied
-		// try to update resource
-		return doApplyPatch(ctx, dynamicClient, restMapper, resourceCopy, curObj)
+
+			statusCauses, ok := getStatusCause(patchError)
+			if !ok {
+				return false, patchError
+			}
+
+			resourceCopy := resource.DeepCopy()
+			for _, cause := range statusCauses {
+				if cause.Type != metav1.CauseTypeFieldValueInvalid {
+					continue
+				}
+				// apply immutable value
+				fields := strings.Split(cause.Field, ".")
+				setNestedField(resourceCopy, getNestedString(curObj.Object, fields...), fields...)
+			}
+			// update with immutable values applied
+			// retry to update resource
+			if patchError = doApplyPatch(ctx, dynamicClient, restMapper, resourceCopy, curObj); patchError == nil {
+				return true, nil
+			}
+			return false, nil
+		})
 	}
 
-	return nil
+	return err
 }
 
 func getOriginalConfiguration(current *unstructured.Unstructured) []byte {
